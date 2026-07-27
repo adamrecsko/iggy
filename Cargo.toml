@@ -50,6 +50,7 @@ members = [
     "core/connectors/sources/influxdb_source",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
+    "core/connectors/sinks/fluss_sink",
     "core/consensus",
     "core/cpu_allocation",
     "core/harness_derive",
