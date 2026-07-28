@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::writer::FlussWriter;
+use crate::{schema::FlussTableLayout, writer::FlussWriter};
 
 mod schema;
 mod writer;
@@ -27,7 +27,7 @@ pub struct FlussSink {
     fluss_config: FlussSinkConfig,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FlussSinkConfig {
     pub bootstrap_servers: String,
     pub fluss_database: String,
@@ -38,17 +38,18 @@ pub struct FlussSinkConfig {
     pub include_checksum: bool,
     pub include_origin_timestamp: bool,
     pub payload_format: String,
+    pub create_table: bool,
 }
 
 impl FlussSink {
+    #[allow(dead_code)]
     fn new(id: u32, config: FlussSinkConfig) -> Self {
-        let writer = FlussWriter::new(config.bootstrap_servers.clone());
         Self {
             id,
             state: Mutex::new(State {
                 invocations_count: 0,
             }),
-            fluss_writer: writer,
+            fluss_writer: FlussWriter::new(config.clone()),
             fluss_config: config,
         }
     }
@@ -88,12 +89,21 @@ impl Sink for FlussSink {
             self.fluss_config.fluss_table.clone(),
         );
 
+        let table_layout = FlussTableLayout::from_config(&self.fluss_config);
+
         self.fluss_writer
-            .write_to_table(table_path, messages_metadata, messages, topic_metadata)
+            .write_to_table(
+                table_path,
+                messages_metadata,
+                messages,
+                topic_metadata,
+                table_layout,
+            )
             .await
     }
 
     async fn close(&mut self) -> Result<(), Error> {
+        // TODO: graceful shutdown fluss client
         info!("Closing Fluss Sink");
         Ok(())
     }

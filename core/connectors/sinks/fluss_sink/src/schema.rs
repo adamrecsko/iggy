@@ -1,123 +1,171 @@
 use fluss::{
     error::Error,
-    metadata::{DataTypes, Schema, TableDescriptor},
-    row::GenericRow,
+    metadata::{DataType, DataTypes, Schema, TableDescriptor},
+    row::{Datum, GenericRow},
 };
-use iggy_connector_sdk::{ConsumedMessage, MessagesMetadata, TopicMetadata};
-use serde::Serialize;
+use iggy_connector_sdk::ConsumedMessage;
 
-#[derive(Debug, Serialize)]
-struct MetadataEnvelope {
-    metadata: IggyMetadata,
-    payload: serde_json::Value,
+use crate::FlussSinkConfig;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnKind {
+    MessageId,
+    Checksum,
+    MessageTimestamp,
+    OriginTimestamp,
+    MessageOffset,
+    Stream,
+    Topic,
+    PartitionId,
+    BinaryPayload,
+    JSONPayload,
 }
 
-#[derive(Debug, Serialize)]
-struct IggyMetadata {
-    iggy_id: String,
-    iggy_offset: u64,
-    iggy_timestamp: u64,
-    iggy_stream: String,
-    iggy_topic: String,
-    iggy_partition_id: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    iggy_checksum: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    iggy_origin_timestamp: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    iggy_headers: Option<serde_json::Map<String, serde_json::Value>>,
+impl ColumnKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::MessageId => "id",
+            Self::Checksum => "checksum",
+            Self::MessageTimestamp => "iggy_timestamp",
+            Self::OriginTimestamp => "iggy_origin_timestamp",
+            Self::MessageOffset => "iggy_offset",
+            Self::Stream => "iggy_stream",
+            Self::Topic => "iggy_topic",
+            Self::PartitionId => "iggy_partition_id",
+            Self::BinaryPayload => "payload",
+            Self::JSONPayload => "payload",
+        }
+    }
+
+    fn data_type(self) -> DataType {
+        match self {
+            Self::MessageId
+            | Self::Checksum
+            | Self::MessageTimestamp
+            | Self::OriginTimestamp
+            | Self::MessageOffset
+            | Self::Stream
+            | Self::Topic => DataTypes::string(),
+            Self::PartitionId => DataTypes::bigint(),
+            Self::BinaryPayload => DataTypes::bytes(),
+            Self::JSONPayload => DataTypes::string(),
+        }
+    }
 }
 
-#[derive(Debug, Default)]
-pub struct IggyDefaultTable {
-    include_checksum: bool,
-    include_timestamp: bool,
-    include_origin_timestamp: bool,
-    include_metadata: bool,
-    primary_key: Vec<String>,
+#[derive(Debug, Clone, Copy)]
+pub struct RowContext<'a> {
+    pub stream: &'a str,
+    pub topic: &'a str,
+    pub partition_id: u32,
 }
 
-impl IggyDefaultTable {
-    pub fn create_schema(&self) -> Result<Schema, Error> {
-        let mut schema_builder = Schema::builder().column("id", DataTypes::string());
+impl ColumnKind {
+    fn datum<'a>(
+        self,
+        message: &'a ConsumedMessage,
+        context: RowContext<'a>,
+    ) -> Result<Datum<'a>, iggy_connector_sdk::Error> {
+        match self {
+            Self::MessageId => Ok(message.id.to_string().into()),
+            Self::Checksum => Ok(message.checksum.to_string().into()),
+            Self::MessageTimestamp => Ok(message.timestamp.to_string().into()),
+            Self::OriginTimestamp => Ok(message.origin_timestamp.to_string().into()),
+            Self::MessageOffset => Ok(message.offset.to_string().into()),
+            Self::Stream => Ok(context.stream.into()),
+            Self::Topic => Ok(context.topic.into()),
+            Self::PartitionId => Ok(i64::from(context.partition_id).into()),
+            Self::BinaryPayload => message
+                .payload
+                .clone()
+                .try_into_vec()
+                .map(Into::into)
+                .map_err(|_| {
+                    iggy_connector_sdk::Error::Serialization(
+                        "Convert to Fluss Datum has failed".to_string(),
+                    )
+                }),
+            Self::JSONPayload => {
+                let payload_bytes = message.payload.clone().try_into_vec()?;
+                let payload_string = String::from_utf8(payload_bytes).map_err(|e| {
+                    let err_msg = format!("Failed to parse payload as UTF-8 text: {e}");
+                    iggy_connector_sdk::Error::Serialization(err_msg)
+                })?;
+                Ok(payload_string.into())
+            }
+        }
+    }
+}
 
-        if !self.primary_key.is_empty() {
-            schema_builder = schema_builder.primary_key(self.primary_key.clone());
+#[derive(Debug)]
+pub struct FlussTableLayout {
+    columns: Vec<ColumnKind>,
+    primary_key_columns: Vec<String>,
+}
+
+impl FlussTableLayout {
+    pub fn from_config(config: &FlussSinkConfig) -> Self {
+        let mut columns: Vec<ColumnKind> = Vec::with_capacity(10);
+        columns.push(ColumnKind::MessageId);
+
+        if config.include_checksum {
+            columns.push(ColumnKind::Checksum);
+        };
+
+        if config.include_metadata {
+            columns.extend([
+                ColumnKind::MessageOffset,
+                ColumnKind::MessageTimestamp,
+                ColumnKind::Stream,
+                ColumnKind::Topic,
+                ColumnKind::PartitionId,
+            ]);
+        };
+
+        if config.include_origin_timestamp {
+            columns.push(ColumnKind::OriginTimestamp);
         }
 
-        if self.include_checksum {
-            schema_builder = schema_builder.column("checksum", DataTypes::string());
-        }
-        if self.include_timestamp {
-            schema_builder = schema_builder.column("timestamp", DataTypes::string());
-        }
-        if self.include_metadata {
-            schema_builder = schema_builder.column("iggy_offset", DataTypes::string());
-            schema_builder = schema_builder.column("iggy_timestamp", DataTypes::string());
-            schema_builder = schema_builder.column("iggy_stream", DataTypes::string());
-            schema_builder = schema_builder.column("iggy_topic", DataTypes::string());
-            schema_builder = schema_builder.column("iggy_partition_id", DataTypes::bigint());
+        match config.payload_format.as_str() {
+            "bytea" => columns.push(ColumnKind::BinaryPayload),
+            "json" => columns.push(ColumnKind::JSONPayload),
+            "text" => columns.push(ColumnKind::JSONPayload),
+            _ => panic!("Unsupported payload format: {}", config.payload_format),
         }
 
-        schema_builder = schema_builder.column("payload", DataTypes::bytes());
+        Self {
+            columns,
+            primary_key_columns: Vec::new(),
+        }
+    }
+
+    fn build_schema(&self) -> Result<Schema, Error> {
+        let mut schema_builder = Schema::builder();
+        for column in &self.columns {
+            schema_builder = schema_builder.column(column.name(), column.data_type());
+        }
+
+        if !self.primary_key_columns.is_empty() {
+            schema_builder = schema_builder.primary_key(self.primary_key_columns.clone());
+        }
 
         schema_builder.build()
     }
 
-    pub fn create_table_descriptor(&self) -> Result<TableDescriptor, Error> {
-        let schema = self.create_schema()?;
+    pub fn build_table_descriptor(&self) -> Result<TableDescriptor, Error> {
+        let schema = self.build_schema()?;
         TableDescriptor::builder().schema(schema).build()
     }
 
-    pub fn create_generic_row(
+    pub fn row_from_message<'a>(
         &self,
-        schema: &Schema,
-        message: &ConsumedMessage,
-        metadata: &MessagesMetadata,
-        topic_metadata: &TopicMetadata,
-    ) -> Result<GenericRow<'_>, Error> {
-        let mut row = GenericRow::new(schema.columns().len());
-        let mut idx = 0;
-        row.set_field(idx, message.id.to_string());
-        idx += 1;
-
-        if self.include_checksum {
-            row.set_field(idx, message.checksum.to_string());
-            idx += 1;
+        message: &'a ConsumedMessage,
+        context: RowContext<'a>,
+    ) -> Result<GenericRow<'a>, iggy_connector_sdk::Error> {
+        let mut values: Vec<Datum> = Vec::with_capacity(self.columns.len());
+        for column in &self.columns {
+            values.push(column.datum(message, context)?);
         }
-        if self.include_timestamp {
-            row.set_field(idx, message.timestamp.to_string());
-            idx += 1;
-        }
-
-        if self.include_metadata {
-            row.set_field(idx, message.offset.to_string());
-            idx += 1;
-
-            row.set_field(idx, message.timestamp.to_string());
-            idx += 1;
-
-            row.set_field(idx, topic_metadata.stream.clone());
-            idx += 1;
-
-            row.set_field(idx, topic_metadata.topic.clone());
-            idx += 1;
-
-            row.set_field(idx, i64::from(metadata.partition_id));
-            idx += 1;
-        }
-
-        let payload_bytes =
-            message
-                .payload
-                .try_to_bytes()
-                .map_err(|error| Error::UnexpectedError {
-                    message: "Failed to serialize payload".to_string(),
-                    source: Some(Box::new(error)),
-                })?;
-
-        row.set_field(idx, payload_bytes);
-
-        Ok(row)
+        Ok(GenericRow::from_data(values))
     }
 }

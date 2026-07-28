@@ -5,13 +5,15 @@ use fluss::{
     metadata::{TableDescriptor, TablePath},
 };
 use iggy_connector_sdk::{ConsumedMessage, MessagesMetadata, TopicMetadata};
-use tracing::info;
 
-use crate::schema::IggyDefaultTable;
+use crate::{
+    FlussSinkConfig,
+    schema::{FlussTableLayout, RowContext},
+};
 
 pub struct FlussWriter {
     connection: Option<FlussConnection>,
-    bootstrap_servers: String,
+    config: FlussSinkConfig,
 }
 
 impl Display for FlussWriter {
@@ -37,7 +39,7 @@ impl FlussWriter {
 
     pub async fn connect(&mut self) -> Result<(), iggy_connector_sdk::Error> {
         let config = fluss::config::Config {
-            bootstrap_servers: self.bootstrap_servers.clone(),
+            bootstrap_servers: self.config.bootstrap_servers.clone(),
             ..fluss::config::Config::default()
         };
         let connection = FlussConnection::new(config).await.map_err(|e| {
@@ -49,9 +51,9 @@ impl FlussWriter {
         Ok(())
     }
 
-    pub fn new(bootstrap_servers: String) -> Self {
+    pub fn new(config: FlussSinkConfig) -> Self {
         Self {
-            bootstrap_servers,
+            config,
             connection: None,
         }
     }
@@ -74,20 +76,19 @@ impl FlussWriter {
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
         topic_metadata: &TopicMetadata,
+        table_layout: FlussTableLayout,
     ) -> Result<(), iggy_connector_sdk::Error> {
-        let table_converter = IggyDefaultTable::default();
-        let schema = table_converter.create_schema().map_err(|_| {
-            iggy_connector_sdk::Error::InitError("Can not not create schema".to_string())
-        })?;
-        let table_descriptor = table_converter.create_table_descriptor().map_err(|_| {
+        let table_descriptor = table_layout.build_table_descriptor().map_err(|_| {
             iggy_connector_sdk::Error::InitError("Can not not create table descriptor".to_string())
         })?;
 
-        self.create_table_if_not_exists(&table_path, &table_descriptor)
-            .await
-            .map_err(|_| {
-                iggy_connector_sdk::Error::InitError("Can not create table".to_string())
-            })?;
+        if self.config.create_table {
+            self.create_table_if_not_exists(&table_path, &table_descriptor)
+                .await
+                .map_err(|_| {
+                    iggy_connector_sdk::Error::InitError("Can not create table".to_string())
+                })?;
+        };
 
         let table = self
             .get_connection()?
@@ -103,30 +104,31 @@ impl FlussWriter {
                 )
             })?
             .create_writer()
-            .map_err(|_| iggy_connector_sdk::Error::InitError("Can't create writer".to_string()))?;
+            .map_err(|_| {
+                iggy_connector_sdk::Error::InitError("Can not create writer".to_string())
+            })?;
 
+        // TODO: Consume in batches
+        let context = RowContext {
+            topic: &topic_metadata.topic,
+            stream: &topic_metadata.stream,
+            partition_id: messages_metadata.partition_id,
+        };
         for message in messages {
-            let row = table_converter
-                .create_generic_row(&schema, &message, &messages_metadata, topic_metadata)
+            let row = table_layout
+                .row_from_message(&message, context)
                 .map_err(|_| {
                     iggy_connector_sdk::Error::InitError("Can create generic row".to_string())
                 })?;
 
-            writer
-                .append(&row)
-                .map_err(|error| {
-                    iggy_connector_sdk::Error::CannotStoreData(format!(
-                        "Failed to append Fluss row: {error}"
-                    ))
-                })?
-                .await
-                .map_err(|error| {
-                    iggy_connector_sdk::Error::CannotStoreData(format!(
-                        "Failed to write Fluss row: {error}"
-                    ))
-                })?;
+            writer.append(&row).map_err(|e| {
+                iggy_connector_sdk::Error::InitError(
+                    format!("Appending row has failed {}", e).to_string(),
+                )
+            })?;
         }
 
+        //TODO:  flush in batches
         writer
             .flush()
             .await

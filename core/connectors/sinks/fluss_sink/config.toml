@@ -40,4 +40,5 @@ auto_create_table = true
 include_metadata = true
 include_checksum = true
 include_origin_timestamp = true
-payload_format = "bytea"
+payload_format = "json"
+create_table = true
