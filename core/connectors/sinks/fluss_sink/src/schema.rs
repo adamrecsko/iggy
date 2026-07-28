@@ -1,3 +1,20 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 use fluss::{
     error::Error,
     metadata::{DataType, DataTypes, Schema, TableDescriptor},
@@ -18,7 +35,7 @@ enum ColumnKind {
     Topic,
     PartitionId,
     BinaryPayload,
-    JSONPayload,
+    StringPayload,
 }
 
 impl ColumnKind {
@@ -33,7 +50,7 @@ impl ColumnKind {
             Self::Topic => "iggy_topic",
             Self::PartitionId => "iggy_partition_id",
             Self::BinaryPayload => "payload",
-            Self::JSONPayload => "payload",
+            Self::StringPayload => "payload",
         }
     }
 
@@ -48,7 +65,7 @@ impl ColumnKind {
             | Self::Topic => DataTypes::string(),
             Self::PartitionId => DataTypes::bigint(),
             Self::BinaryPayload => DataTypes::bytes(),
-            Self::JSONPayload => DataTypes::string(),
+            Self::StringPayload => DataTypes::string(),
         }
     }
 }
@@ -75,21 +92,27 @@ impl ColumnKind {
             Self::Stream => Ok(context.stream.into()),
             Self::Topic => Ok(context.topic.into()),
             Self::PartitionId => Ok(i64::from(context.partition_id).into()),
-            Self::BinaryPayload => message
-                .payload
-                .clone()
-                .try_into_vec()
-                .map(Into::into)
-                .map_err(|_| {
-                    iggy_connector_sdk::Error::Serialization(
-                        "Convert to Fluss Datum has failed".to_string(),
-                    )
-                }),
-            Self::JSONPayload => {
-                let payload_bytes = message.payload.clone().try_into_vec()?;
-                let payload_string = String::from_utf8(payload_bytes).map_err(|e| {
-                    let err_msg = format!("Failed to parse payload as UTF-8 text: {e}");
-                    iggy_connector_sdk::Error::Serialization(err_msg)
+            Self::BinaryPayload => {
+                message
+                    .payload
+                    .try_to_bytes()
+                    .map(Into::into)
+                    .map_err(|error| {
+                        iggy_connector_sdk::Error::Serialization(format!(
+                            "Failed to serialize payload for Fluss BYTES column: {error}"
+                        ))
+                    })
+            }
+            Self::StringPayload => {
+                let payload_bytes = message.payload.try_to_bytes().map_err(|error| {
+                    iggy_connector_sdk::Error::Serialization(format!(
+                        "Failed to serialize payload for Fluss STRING column: {error}"
+                    ))
+                })?;
+                let payload_string = String::from_utf8(payload_bytes).map_err(|error| {
+                    iggy_connector_sdk::Error::Serialization(format!(
+                        "Payload is not valid UTF-8 for the Fluss STRING column: {error}"
+                    ))
                 })?;
                 Ok(payload_string.into())
             }
@@ -104,7 +127,7 @@ pub struct FlussTableLayout {
 }
 
 impl FlussTableLayout {
-    pub fn from_config(config: &FlussSinkConfig) -> Self {
+    pub fn from_config(config: &FlussSinkConfig) -> Result<Self, iggy_connector_sdk::Error> {
         let mut columns: Vec<ColumnKind> = Vec::with_capacity(10);
         columns.push(ColumnKind::MessageId);
 
@@ -128,15 +151,18 @@ impl FlussTableLayout {
 
         match config.payload_format.as_str() {
             "bytea" => columns.push(ColumnKind::BinaryPayload),
-            "json" => columns.push(ColumnKind::JSONPayload),
-            "text" => columns.push(ColumnKind::JSONPayload),
-            _ => panic!("Unsupported payload format: {}", config.payload_format),
+            "json" | "text" => columns.push(ColumnKind::StringPayload),
+            unsupported => {
+                return Err(iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                    "unsupported Fluss payload_format '{unsupported}'; expected one of: bytea, json, text"
+                )));
+            }
         }
 
-        Self {
+        Ok(Self {
             columns,
             primary_key_columns: Vec::new(),
-        }
+        })
     }
 
     fn build_schema(&self) -> Result<Schema, Error> {
