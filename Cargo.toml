@@ -37,6 +37,7 @@ members = [
     "core/connectors/sinks/delta_sink",
     "core/connectors/sinks/doris_sink",
     "core/connectors/sinks/elasticsearch_sink",
+    "core/connectors/sinks/fluss_sink",
     "core/connectors/sinks/http_sink",
     "core/connectors/sinks/iceberg_sink",
     "core/connectors/sinks/influxdb_sink",
