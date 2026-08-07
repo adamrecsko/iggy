@@ -19,12 +19,13 @@ use crate::connectors::fixtures::FlussSinkFixture;
 use crate::connectors::{TestMessage, create_test_messages};
 use bytes::Bytes;
 use fluss::metadata::{Column, DataTypes, Schema};
-use fluss::row::InternalRow;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::Identifier;
 use iggy_common::MessageClient;
 use integration::harness::seeds;
 use integration::iggy_harness;
+
+use fluss::row::DataGetters;
 
 const TEST_MESSAGE_COUNT: usize = 10;
 const ROW_COMPARISON_MESSAGE_COUNT: usize = 3;

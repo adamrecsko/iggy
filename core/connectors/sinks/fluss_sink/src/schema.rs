@@ -360,35 +360,45 @@ mod tests {
         assert_eq!(
             descriptor.schema().columns(),
             [
-                Column::new("id", DataTypes::string()).with_comment("Apache Iggy message ID"),
+                Column::new("id", DataTypes::string())
+                    .with_comment("Apache Iggy message ID")
+                    .with_id(0),
                 Column::new(
                     "checksum",
                     DataTypes::decimal(UNSIGNED_64_DECIMAL_PRECISION, 0),
                 )
-                .with_comment("Apache Iggy message checksum"),
+                .with_comment("Apache Iggy message checksum")
+                .with_id(1),
                 Column::new(
                     "iggy_offset",
                     DataTypes::decimal(UNSIGNED_64_DECIMAL_PRECISION, 0),
                 )
-                .with_comment("Apache Iggy message offset"),
+                .with_comment("Apache Iggy message offset")
+                .with_id(2),
                 Column::new(
                     "iggy_timestamp",
                     DataTypes::timestamp_ltz_with_precision(TIMESTAMP_PRECISION),
                 )
-                .with_comment("Apache Iggy message timestamp"),
+                .with_comment("Apache Iggy message timestamp")
+                .with_id(3),
                 Column::new("iggy_stream", DataTypes::string())
-                    .with_comment("Apache Iggy stream name"),
+                    .with_comment("Apache Iggy stream name")
+                    .with_id(4),
                 Column::new("iggy_topic", DataTypes::string())
-                    .with_comment("Apache Iggy topic name"),
+                    .with_comment("Apache Iggy topic name")
+                    .with_id(5),
                 Column::new("iggy_partition_id", DataTypes::bigint())
-                    .with_comment("Apache Iggy partition ID"),
+                    .with_comment("Apache Iggy partition ID")
+                    .with_id(6),
                 Column::new(
                     "iggy_origin_timestamp",
                     DataTypes::timestamp_ltz_with_precision(TIMESTAMP_PRECISION),
                 )
-                .with_comment("Apache Iggy message origin timestamp"),
+                .with_comment("Apache Iggy message origin timestamp")
+                .with_id(7),
                 Column::new("payload", DataTypes::string())
-                    .with_comment("Apache Iggy message payload"),
+                    .with_comment("Apache Iggy message payload")
+                    .with_id(8),
             ]
         );
         assert_eq!(
