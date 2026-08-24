@@ -29,7 +29,9 @@ pub enum PayloadFormat {
     Text,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+const DEFAULT_FLUSS_WRITER_RETRIES: i32 = 3;
+
+#[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct FlussSinkConfig {
     pub bootstrap_servers: String,
@@ -65,7 +67,7 @@ impl Default for FlussSinkConfig {
             bootstrap_servers: fluss_config.bootstrap_servers,
             writer_request_max_size: fluss_config.writer_request_max_size,
             writer_acks: fluss_config.writer_acks,
-            writer_retries: fluss_config.writer_retries,
+            writer_retries: DEFAULT_FLUSS_WRITER_RETRIES,
             writer_batch_size: fluss_config.writer_batch_size,
             writer_bucket_no_key_assigner: fluss_config.writer_bucket_no_key_assigner,
             writer_batch_timeout_ms: fluss_config.writer_batch_timeout_ms,
@@ -133,17 +135,32 @@ mod tests {
     use iggy_connector_sdk::Error;
     use serde_json::json;
 
-    use super::{FlussSinkConfig, PayloadFormat};
+    use super::{DEFAULT_FLUSS_WRITER_RETRIES, FlussSinkConfig, PayloadFormat};
 
     #[test]
-    fn given_default_sink_config_when_converting_should_match_fluss_defaults() {
+    fn given_default_sink_config_when_converting_should_use_connector_retry_default() {
         let sink_config = FlussSinkConfig::default();
         let fluss_config = FlussConfig::try_from(&sink_config).expect("Sink config should convert");
         let actual = serde_json::to_value(fluss_config).expect("Fluss config should serialize");
-        let expected =
-            serde_json::to_value(FlussConfig::default()).expect("Fluss config should serialize");
+        let expected = serde_json::to_value(FlussConfig {
+            writer_retries: DEFAULT_FLUSS_WRITER_RETRIES,
+            ..FlussConfig::default()
+        })
+        .expect("Fluss config should serialize");
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn given_explicit_writer_retries_when_converting_should_preserve_value() {
+        let config = FlussSinkConfig {
+            writer_retries: i32::MAX,
+            ..FlussSinkConfig::default()
+        };
+
+        let fluss_config = FlussConfig::try_from(&config).expect("Sink config should convert");
+
+        assert_eq!(fluss_config.writer_retries, i32::MAX);
     }
 
     #[test]
@@ -161,6 +178,7 @@ mod tests {
         .expect("Existing Fluss sink config should deserialize");
 
         assert_eq!(config.writer_batch_size, 2 * 1024 * 1024);
+        assert_eq!(config.writer_retries, DEFAULT_FLUSS_WRITER_RETRIES);
         assert_eq!(config.writer_buffer_wait_timeout_ms, u64::MAX.to_string());
         assert_eq!(config.payload_format, PayloadFormat::Json);
         assert_eq!(config.target_database, "analytics");

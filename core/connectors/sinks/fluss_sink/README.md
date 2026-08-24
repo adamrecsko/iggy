@@ -86,7 +86,7 @@ fields are added because missing fields use the connector defaults.
 | `bootstrap_servers` | string | `"127.0.0.1:9123"` | Fluss coordinator address. |
 | `writer_request_max_size` | i32 | `10485760` | Maximum writer request size in bytes. |
 | `writer_acks` | string | `"all"` | Required acknowledgements. `"all"` waits for all required replicas. |
-| `writer_retries` | i32 | `2147483647` | Maximum retries for transient writer failures. |
+| `writer_retries` | i32 | `3` | Maximum retries for transient writer failures. |
 | `writer_batch_size` | i32 | `2097152` | Target Fluss writer batch size in bytes. |
 | `writer_batch_timeout_ms` | i64 | `100` | Maximum time to wait for a writer batch to fill before sending it. |
 | `writer_bucket_no_key_assigner` | enum | `"sticky"` | Bucket selection for tables without bucket keys: `sticky` or `round_robin`. |
@@ -128,7 +128,7 @@ security_sasl_password = "replace-with-secret"
 | `json` | `STRING` | Serializes the payload to bytes and stores the resulting UTF-8 string. |
 | `text` | `STRING` | Serializes the payload to bytes and stores the resulting UTF-8 string. |
 
-`json` and `text` currently use the same Fluss schema and row conversion. The
+`json` and `text` currently use the same Fluss schema and Arrow conversion. The
 sink does not parse or validate JSON itself. Configure the Iggy stream with
 `schema = "json"` when JSON validation is required before the sink receives the
 message.
@@ -210,8 +210,8 @@ For every batch received from the Iggy connector runtime, the sink:
 
 1. Creates the table if `auto_create_table` is enabled and the table is missing.
 2. Opens an append writer for the target table.
-3. Converts each Iggy message to a Fluss row.
-4. Appends every row and flushes the writer.
+3. Converts the Iggy messages into an Arrow record batch.
+4. Appends the batch and flushes the writer.
 
 The effective message count per call is controlled by the stream
 `batch_length`. Fluss may combine those rows into byte-sized writer batches

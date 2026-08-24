@@ -39,13 +39,14 @@ auto_create_table = true
 include_metadata = true
 include_checksum = true
 include_origin_timestamp = true
+# payload_format = "bytea"
 payload_format = "json"
 
 # fluss connection settings, passed to the fluss connector
 bootstrap_servers = "127.0.0.1:9123"
 writer_request_max_size = 10485760
 writer_acks = "all"
-writer_retries = 2147483647
+writer_retries = 3
 writer_batch_size = 2097152
 writer_bucket_no_key_assigner = "sticky"
 writer_batch_timeout_ms = 100

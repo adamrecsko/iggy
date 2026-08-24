@@ -23,12 +23,11 @@ use iggy_connector_sdk::{
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use crate::{schema::FlussTableLayout, writer::FlussWriter};
+use crate::{schema::SingleTableLayout, writer::FlussWriter};
 
 mod config;
 mod schema;
 mod writer;
-
 pub use config::{FlussSinkConfig, PayloadFormat};
 
 sink_connector!(FlussSink);
@@ -46,12 +45,13 @@ pub struct FlussSink {
     state: Mutex<State>,
     fluss_writer: writer::FlussWriter,
     fluss_config: FlussSinkConfig,
-    table_layout: Option<FlussTableLayout>,
+    table_layout: SingleTableLayout,
     table_path: TablePath,
 }
 
 impl FlussSink {
     pub fn new(id: u32, config: FlussSinkConfig) -> Self {
+        let table_layout = SingleTableLayout::from_config(&config);
         let table_path =
             TablePath::new(config.target_database.clone(), config.target_table.clone());
         Self {
@@ -63,7 +63,7 @@ impl FlussSink {
             }),
             fluss_writer: FlussWriter::new(config.clone()),
             fluss_config: config,
-            table_layout: None,
+            table_layout,
             table_path,
         }
     }
@@ -72,14 +72,13 @@ impl FlussSink {
 #[async_trait]
 impl Sink for FlussSink {
     async fn open(&mut self) -> Result<(), Error> {
-        let table_layout = FlussTableLayout::from_config(&self.fluss_config)?;
-        self.fluss_writer.connect().await?;
-
+        let table_layout = SingleTableLayout::from_config(&self.fluss_config);
+        self.fluss_writer.connect().await.map_err(Error::from)?;
         self.fluss_writer
             .ensure_table_exists(&self.table_path, &table_layout)
-            .await?;
+            .await
+            .map_err(Error::from)?;
 
-        self.table_layout = Some(table_layout);
         info!("Opened Fluss sink connector ID: {}", self.id);
         Ok(())
     }
@@ -108,40 +107,36 @@ impl Sink for FlussSink {
             invocation
         );
 
-        let table_layout = self
-            .table_layout
-            .as_ref()
-            .ok_or_else(|| Error::InitError("Fluss table layout is not initialized".to_string()))?;
-
-        match self
+        let result = self
             .fluss_writer
             .write_to_table(
+                self.id,
                 &self.table_path,
                 messages_metadata,
                 messages,
                 topic_metadata,
-                table_layout,
+                &self.table_layout,
             )
-            .await
-        {
-            Ok(result) => {
+            .await;
+
+        match result {
+            Ok(r) => {
                 let mut state = self.state.lock().await;
-                state.insertion_errors += result.insertion_errors;
-                state.messages_processed += result.messages_processed;
+                state.insertion_errors += r.insertion_errors;
+                state.messages_processed += r.messages_processed;
                 Ok(())
             }
 
-            Err(e) => Err(e),
+            Err(error) => Err(error.into()),
         }
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        // fluss-rs 0.1.0 exposes no public connection close API
         let state = self.state.lock().await;
         info!(
             "Fluss sink ID: {} processed {} messages with {} errors",
             self.id, state.messages_processed, state.insertion_errors
         );
-        Ok(())
+        self.fluss_writer.close().await.map_err(Into::into)
     }
 }
