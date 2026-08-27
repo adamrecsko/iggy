@@ -321,7 +321,7 @@ impl SingleTableBatchBuilder {
 
         self.len = 0;
 
-        let payload_field = Arc::new(Field::new("payload", payload.data_type().clone(), true));
+        let payload_field = Arc::new(Field::new("payload", payload.data_type().clone(), false));
         cols.push((payload_field, payload));
 
         RecordBatch::from(StructArray::from(cols))

@@ -26,16 +26,10 @@ use fluss::{
     error::Error as FlussError,
     metadata::{TableDescriptor, TablePath},
 };
-use iggy_connector_sdk::{
-    ConsumedMessage, Error as ConnectorError, MessagesMetadata, TopicMetadata,
-};
+use iggy_connector_sdk::Error as ConnectorError;
 use thiserror::Error;
-use tracing::error;
 
-use crate::{
-    FlussSinkConfig,
-    schema::{Error as SchemaError, RowContext, SingleTableLayout},
-};
+use crate::{FlussSinkConfig, schema::Error as SchemaError};
 
 #[derive(Debug, Error)]
 pub(crate) enum WriterError {
@@ -70,11 +64,6 @@ pub(crate) enum WriterError {
         table_path: TablePath,
         #[source]
         source: Box<FlussError>,
-    },
-    #[error("Failed to build Fluss table descriptor: {source}")]
-    BuildTableDescriptor {
-        #[source]
-        source: Box<SchemaError>,
     },
     #[error("Failed to get Fluss table '{table_path}': {source}")]
     GetTable {
@@ -133,7 +122,6 @@ impl From<WriterError> for ConnectorError {
             WriterError::CloseConnection { .. } => Self::Connection(message),
             WriterError::GetAdminClient { .. }
             | WriterError::CreateTable { .. }
-            | WriterError::BuildTableDescriptor { .. }
             | WriterError::GetTable { .. }
             | WriterError::CreateAppender { .. }
             | WriterError::CreateWriter { .. }
@@ -147,6 +135,26 @@ impl From<WriterError> for ConnectorError {
 pub struct TableWriteResult {
     pub insertion_errors: u64,
     pub messages_processed: u64,
+}
+
+#[derive(Eq, PartialEq, Debug)]
+pub enum Op {
+    Append,
+}
+
+pub(crate) trait TableWriter {
+    async fn write_to_table(
+        &self,
+        table_path: &TablePath,
+        op: Op,
+        batch: RecordBatch,
+    ) -> Result<(), WriterError>;
+
+    async fn create_table_if_not_exists(
+        &self,
+        table_path: &TablePath,
+        table_descriptor: &TableDescriptor,
+    ) -> Result<(), WriterError>;
 }
 
 pub struct FlussWriter {
@@ -176,7 +184,7 @@ impl FlussWriter {
         }
     }
 
-    pub async fn connect(&mut self) -> Result<(), WriterError> {
+    pub(crate) async fn connect(&mut self) -> Result<(), WriterError> {
         let config = fluss::config::Config::try_from(&self.config)?;
         let connection =
             FlussConnection::new(config)
@@ -193,7 +201,7 @@ impl FlussWriter {
         Ok(())
     }
 
-    pub async fn close(&self) -> Result<(), WriterError> {
+    pub(crate) async fn close(&self) -> Result<(), WriterError> {
         self.get_connection()?
             .get_or_create_writer_client()
             .map_err(|source| WriterError::InvalidWriterConfig {
@@ -203,28 +211,8 @@ impl FlussWriter {
             .await
             .map_err(|source| WriterError::CloseConnection {
                 source: Box::new(source),
-            })?;
-        Ok(())
+            })
     }
-
-    pub async fn ensure_table_exists(
-        &self,
-        table_path: &TablePath,
-        table_layout: &SingleTableLayout,
-    ) -> Result<(), WriterError> {
-        if self.config.auto_create_table {
-            let table_descriptor = table_layout.build_table_descriptor().map_err(|source| {
-                WriterError::BuildTableDescriptor {
-                    source: Box::new(source),
-                }
-            })?;
-
-            self.create_table_if_not_exists(table_path, &table_descriptor)
-                .await?;
-        }
-        Ok(())
-    }
-
     async fn append_record_batch(
         &self,
         table_path: &TablePath,
@@ -240,60 +228,10 @@ impl FlussWriter {
         self.flush(&writer, table_path).await
     }
 
-    pub async fn write_to_table(
-        &self,
-        sink_id: u32,
-        table_path: &TablePath,
-        messages_metadata: MessagesMetadata,
-        messages: Vec<ConsumedMessage>,
-        topic_metadata: &TopicMetadata,
-        table_layout: &SingleTableLayout,
-    ) -> Result<TableWriteResult, WriterError> {
-        let mut stat = TableWriteResult::default();
-        let context = RowContext {
-            topic: topic_metadata.topic.clone(),
-            stream: topic_metadata.stream.clone(),
-            partition_id: messages_metadata.partition_id,
-        };
-        let mut builder = table_layout.create_arrow_builder();
-        for message in messages {
-            if let Err(err) = builder.append(message) {
-                error!(
-                    "FlussSink [SinkID: {}]: Can not add record to batch builder, skipping message because of error: [{}]",
-                    sink_id, err
-                );
-                stat.insertion_errors += 1;
-            } else {
-                stat.messages_processed += 1;
-            }
-        }
-        self.append_record_batch(table_path, builder.finish(&context))
-            .await?;
-        Ok(stat)
-    }
-
     fn get_connection(&self) -> Result<&FlussConnection, WriterError> {
         self.connection
             .as_ref()
             .ok_or(WriterError::ConnectionNotInitialized)
-    }
-
-    async fn create_table_if_not_exists(
-        &self,
-        table_path: &TablePath,
-        table_descriptor: &TableDescriptor,
-    ) -> Result<(), WriterError> {
-        self.get_connection()?
-            .get_admin()
-            .map_err(|source| WriterError::GetAdminClient {
-                source: Box::new(source),
-            })?
-            .create_table(table_path, table_descriptor, true)
-            .await
-            .map_err(|source| WriterError::CreateTable {
-                table_path: table_path.clone(),
-                source: Box::new(source),
-            })
     }
 
     async fn create_writer(&self, table_path: &TablePath) -> Result<AppendWriter, WriterError> {
@@ -331,6 +269,37 @@ impl FlussWriter {
                 table_path: table_path.clone(),
                 source: Box::new(source),
             })
+    }
+}
+
+impl TableWriter for FlussWriter {
+    async fn create_table_if_not_exists(
+        &self,
+        table_path: &TablePath,
+        table_descriptor: &TableDescriptor,
+    ) -> Result<(), WriterError> {
+        self.get_connection()?
+            .get_admin()
+            .map_err(|source| WriterError::GetAdminClient {
+                source: Box::new(source),
+            })?
+            .create_table(table_path, table_descriptor, true)
+            .await
+            .map_err(|source| WriterError::CreateTable {
+                table_path: table_path.clone(),
+                source: Box::new(source),
+            })
+    }
+
+    async fn write_to_table(
+        &self,
+        table_path: &TablePath,
+        op: Op,
+        batch: RecordBatch,
+    ) -> Result<(), WriterError> {
+        match op {
+            Op::Append => self.append_record_batch(table_path, batch).await,
+        }
     }
 }
 
