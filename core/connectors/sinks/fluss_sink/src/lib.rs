@@ -16,16 +16,16 @@
 // under the License.
 
 use async_trait::async_trait;
-use fluss::metadata::TablePath;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use crate::{schema::SingleTableLayout, writer::FlussWriter};
+use crate::{router::SingleTableRouter, writer::FlussWriter};
 
 mod config;
+mod router;
 mod schema;
 mod writer;
 pub use config::{FlussSinkConfig, PayloadFormat};
@@ -43,17 +43,14 @@ struct State {
 pub struct FlussSink {
     id: u32,
     state: Mutex<State>,
-    fluss_writer: writer::FlussWriter,
-    fluss_config: FlussSinkConfig,
-    table_layout: SingleTableLayout,
-    table_path: TablePath,
+    writer: writer::FlussWriter,
+    router: SingleTableRouter,
 }
 
 impl FlussSink {
     pub fn new(id: u32, config: FlussSinkConfig) -> Self {
-        let table_layout = SingleTableLayout::from_config(&config);
-        let table_path =
-            TablePath::new(config.target_database.clone(), config.target_table.clone());
+        let writer = FlussWriter::new(config.clone());
+        let router = SingleTableRouter::new(&config);
         Self {
             id,
             state: Mutex::new(State {
@@ -61,10 +58,8 @@ impl FlussSink {
                 messages_processed: 0,
                 insertion_errors: 0,
             }),
-            fluss_writer: FlussWriter::new(config.clone()),
-            fluss_config: config,
-            table_layout,
-            table_path,
+            writer,
+            router,
         }
     }
 }
@@ -72,13 +67,8 @@ impl FlussSink {
 #[async_trait]
 impl Sink for FlussSink {
     async fn open(&mut self) -> Result<(), Error> {
-        let table_layout = SingleTableLayout::from_config(&self.fluss_config);
-        self.fluss_writer.connect().await.map_err(Error::from)?;
-        self.fluss_writer
-            .ensure_table_exists(&self.table_path, &table_layout)
-            .await
-            .map_err(Error::from)?;
-
+        self.writer.connect().await.map_err(Error::from)?;
+        self.router.init(&self.writer).await?;
         info!("Opened Fluss sink connector ID: {}", self.id);
         Ok(())
     }
@@ -106,17 +96,9 @@ impl Sink for FlussSink {
             messages_metadata.current_offset,
             invocation
         );
-
         let result = self
-            .fluss_writer
-            .write_to_table(
-                self.id,
-                &self.table_path,
-                messages_metadata,
-                messages,
-                topic_metadata,
-                &self.table_layout,
-            )
+            .router
+            .route(&self.writer, topic_metadata, messages_metadata, messages)
             .await;
 
         match result {
@@ -137,6 +119,6 @@ impl Sink for FlussSink {
             "Fluss sink ID: {} processed {} messages with {} errors",
             self.id, state.messages_processed, state.insertion_errors
         );
-        self.fluss_writer.close().await.map_err(Into::into)
+        self.writer.close().await.map_err(Into::into)
     }
 }
