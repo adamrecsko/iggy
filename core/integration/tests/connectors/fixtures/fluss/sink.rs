@@ -35,6 +35,7 @@ const DEFAULT_SINK_TABLE: &str = "iggy_messages";
 
 const ENV_SINK_BOOTSTRAP_SERVERS: &str =
     "IGGY_CONNECTORS_SINK_FLUSS_PLUGIN_CONFIG_BOOTSTRAP_SERVERS";
+const ENV_SINK_ROUTER_TYPE: &str = "IGGY_CONNECTORS_SINK_FLUSS_PLUGIN_CONFIG_ROUTER_TYPE";
 const ENV_SINK_TARGET_TABLE: &str = "IGGY_CONNECTORS_SINK_FLUSS_PLUGIN_CONFIG_TARGET_TABLE";
 const ENV_SINK_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_FLUSS_STREAMS_0_STREAM";
 const ENV_SINK_STREAMS_0_TOPICS: &str = "IGGY_CONNECTORS_SINK_FLUSS_STREAMS_0_TOPICS";
@@ -49,9 +50,18 @@ fn create_test_table_path() -> TablePath {
 
 pub struct FlussSinkFixture {
     cluster: FlussCluster,
+    router_type: &'static str,
 }
 
 impl FlussSinkFixture {
+    async fn setup_with_router_type(router_type: &'static str) -> Result<Self, TestBinaryError> {
+        let cluster = FlussCluster::new(DEFAULT_FLUSS_VERSION).await?;
+        Ok(Self {
+            cluster,
+            router_type,
+        })
+    }
+
     pub async fn get_fluss_connection(&self) -> Result<FlussConnection, TestBinaryError> {
         self.cluster.get_connection().await
     }
@@ -154,8 +164,7 @@ impl FlussSinkFixture {
 #[async_trait]
 impl TestFixture for FlussSinkFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
-        let cluster = FlussCluster::new(DEFAULT_FLUSS_VERSION).await?;
-        Ok(Self { cluster })
+        Self::setup_with_router_type("single").await
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
@@ -167,6 +176,10 @@ impl TestFixture for FlussSinkFixture {
             (
                 ENV_SINK_TARGET_TABLE.to_string(),
                 DEFAULT_SINK_TABLE.to_string(),
+            ),
+            (
+                ENV_SINK_ROUTER_TYPE.to_string(),
+                self.router_type.to_string(),
             ),
             (
                 ENV_SINK_STREAMS_0_STREAM.to_string(),
@@ -186,5 +199,28 @@ impl TestFixture for FlussSinkFixture {
                 "../../target/debug/libiggy_connector_fluss_sink".to_string(),
             ),
         ])
+    }
+}
+
+pub struct FlussMultiSinkFixture(FlussSinkFixture);
+
+impl std::ops::Deref for FlussMultiSinkFixture {
+    type Target = FlussSinkFixture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[async_trait]
+impl TestFixture for FlussMultiSinkFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        FlussSinkFixture::setup_with_router_type("multi")
+            .await
+            .map(Self)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.0.connectors_runtime_envs()
     }
 }

@@ -19,7 +19,7 @@ mod cluster;
 mod sink;
 
 use integration::harness::TestBinaryError;
-pub use sink::FlussSinkFixture;
+pub use sink::{FlussMultiSinkFixture, FlussSinkFixture};
 
 fn fixture_error(message: String) -> TestBinaryError {
     TestBinaryError::FixtureSetup {

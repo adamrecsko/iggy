@@ -55,6 +55,7 @@ consumer_group = "fluss_sink"
 
 [plugin_config]
 bootstrap_servers = "127.0.0.1:9123"
+verbose_logging = false
 target_database = "fluss"
 target_table = "iggy_messages"
 auto_create_table = true
@@ -71,6 +72,7 @@ fields are added because missing fields use the connector defaults.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `verbose_logging` | bool | `false` | Log per-batch connector details at info level. |
 | `target_database` | string | `"fluss"` | Target Fluss database. The database must already exist. |
 | `target_table` | string | `"iggy_messages"` | Target Fluss table. |
 | `auto_create_table` | bool | `true` | Create the target table if it does not exist before writing a batch. Existing tables are left unchanged. |

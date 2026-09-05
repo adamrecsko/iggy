@@ -33,6 +33,7 @@ consumer_group = "fluss_sink"
 
 [plugin_config]
 # iggy's fluss table settings
+verbose_logging = false
 target_database = "fluss"
 target_table = "iggy_messages"
 auto_create_table = true
