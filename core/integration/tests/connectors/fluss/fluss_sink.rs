@@ -15,16 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connectors::fixtures::FlussSinkFixture;
-use crate::connectors::{TestMessage, create_test_messages};
+use std::time::Duration;
+
 use bytes::Bytes;
-use fluss::metadata::{Column, DataTypes, Schema};
-use fluss::row::{DataGetters, Decimal, TimestampLtz};
+use fluss::{
+    client::EARLIEST_OFFSET,
+    metadata::{Column, DataType, DataTypes, Schema, TablePath},
+    row::{DataGetters, Decimal, InternalArray, TimestampLtz},
+};
 use iggy::prelude::{Consumer, IggyMessage, Partitioning, PollingStrategy};
 use iggy_common::Identifier;
 use iggy_common::MessageClient;
 use integration::harness::seeds;
 use integration::iggy_harness;
+use tokio::time::{Instant, timeout_at};
+
+use crate::connectors::fixtures::{FlussMultiSinkFixture, FlussSinkFixture};
+use crate::connectors::{TestMessage, create_test_messages};
 
 const TEST_MESSAGE_COUNT: usize = 10;
 const ROW_COMPARISON_MESSAGE_COUNT: u32 = 3;
@@ -40,6 +47,8 @@ const PAYLOAD_COLUMN_INDEX: usize = 8;
 const UNSIGNED_64_DECIMAL_PRECISION: u32 = 20;
 const TIMESTAMP_PRECISION: u32 = 6;
 const WAIT_TIMEOUT_S: u64 = 10;
+const MULTI_TABLE_DATABASE: &str = "fluss";
+const MULTI_TABLE_ROUTES: [&str; 2] = ["multi_table_events_a", "multi_table_events_b"];
 
 fn expected_decimal(value: u64) -> Decimal {
     Decimal::from_arrow_decimal128(i128::from(value), 0, UNSIGNED_64_DECIMAL_PRECISION, 0)
@@ -53,6 +62,16 @@ fn expected_timestamp(value: u64) -> TimestampLtz {
         ((epoch_micros % 1_000) * 1_000) as i32,
     )
     .expect("Test timestamp should convert to Fluss TIMESTAMP_LTZ(6)")
+}
+
+fn row_field<'a>(data_type: &'a DataType, field_name: &str) -> (usize, &'a DataType) {
+    let DataType::Row(row_type) = data_type else {
+        panic!("{field_name} should belong to an inferred row type");
+    };
+    let field_index = row_type
+        .get_field_index(field_name)
+        .unwrap_or_else(|| panic!("Inferred row should contain {field_name}"));
+    (field_index, row_type.fields()[field_index].data_type())
 }
 
 fn expected_sink_schema() -> Schema {
@@ -305,5 +324,269 @@ async fn sink_should_preserve_extra_fields_and_payload_in_rows(
         let actual_message: TestMessage =
             serde_json::from_str(payload).expect("Payload should contain a test message");
         assert_eq!(&actual_message, expected_message);
+    }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/fluss/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn json_messages_sink_creates_inferred_tables_and_routes_rows(
+    harness: &TestHarness,
+    fixture: FlussMultiSinkFixture,
+) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Root client should be available");
+    let stream_id: Identifier = seeds::names::STREAM
+        .try_into()
+        .expect("Stream identifier should be valid");
+    let topic_id: Identifier = seeds::names::TOPIC
+        .try_into()
+        .expect("Topic identifier should be valid");
+    let table_paths = MULTI_TABLE_ROUTES.map(|route| TablePath::new(MULTI_TABLE_DATABASE, route));
+
+    let mut messages: Vec<IggyMessage> = (0..TEST_MESSAGE_COUNT)
+        .map(|index| {
+            let event_id = i64::try_from(index).expect("Test event ID should fit in i64");
+            let score =
+                f64::from(u32::try_from(index).expect("Test score should fit in u32")) + 0.5;
+            let payload = serde_json::json!({
+                "table": table_paths[index % table_paths.len()].to_string(),
+                "event": {
+                    "envelope": {
+                        "context": {
+                            "pipeline": {
+                                "stage": {
+                                    "processor": {
+                                        "runtime": {
+                                            "node": {
+                                                "location": {
+                                                    "details": {
+                                                        "event_id": event_id,
+                                                        "event_type": format!("event-{index}"),
+                                                        "active": index % 2 == 0,
+                                                        "score": score,
+                                                        "tags": [
+                                                            "streaming",
+                                                            null,
+                                                            format!("event-{index}"),
+                                                        ],
+                                                    },
+                                                },
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            });
+            let payload =
+                serde_json::to_vec(&payload).expect("Multi-table message should serialize");
+            IggyMessage::builder()
+                .id((index + 1) as u128)
+                .payload(Bytes::from(payload))
+                .build()
+                .expect("Iggy message should build")
+        })
+        .collect();
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("Messages should be sent");
+
+    let connection = fixture
+        .get_fluss_connection()
+        .await
+        .expect("Fluss connection should be available");
+    let admin = connection
+        .get_admin()
+        .expect("Fluss admin client should be available");
+    let table_creation_deadline = Instant::now() + Duration::from_secs(WAIT_TIMEOUT_S);
+    for table_path in &table_paths {
+        loop {
+            let table_exists = timeout_at(table_creation_deadline, admin.table_exists(table_path))
+                .await
+                .expect("Multi-table target should be created before the timeout")
+                .expect("Multi-table target existence should be readable");
+            if table_exists {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    let table_info = admin
+        .get_table_info(&table_paths[0])
+        .await
+        .expect("Multi-table target metadata should be available");
+    for table_path in &table_paths[1..] {
+        let routed_table_info = admin
+            .get_table_info(table_path)
+            .await
+            .expect("Routed table metadata should be available");
+        assert_eq!(routed_table_info.schema, table_info.schema);
+    }
+    let columns = table_info.schema.columns();
+    let event_column_index = columns
+        .iter()
+        .position(|column| column.name() == "event")
+        .expect("Inferred schema should contain event");
+
+    let event_data_type = columns[event_column_index].data_type();
+    let (envelope_field_index, envelope_data_type) = row_field(event_data_type, "envelope");
+    let (context_field_index, context_data_type) = row_field(envelope_data_type, "context");
+    let (pipeline_field_index, pipeline_data_type) = row_field(context_data_type, "pipeline");
+    let (stage_field_index, stage_data_type) = row_field(pipeline_data_type, "stage");
+    let (processor_field_index, processor_data_type) = row_field(stage_data_type, "processor");
+    let (runtime_field_index, runtime_data_type) = row_field(processor_data_type, "runtime");
+    let (node_field_index, node_data_type) = row_field(runtime_data_type, "node");
+    let (location_field_index, location_data_type) = row_field(node_data_type, "location");
+    let (details_field_index, details_data_type) = row_field(location_data_type, "details");
+    let (event_id_field_index, event_id_data_type) = row_field(details_data_type, "event_id");
+    let (event_type_field_index, event_type_data_type) = row_field(details_data_type, "event_type");
+    let (active_field_index, active_data_type) = row_field(details_data_type, "active");
+    let (score_field_index, score_data_type) = row_field(details_data_type, "score");
+    let (tags_field_index, tags_data_type) = row_field(details_data_type, "tags");
+
+    assert_eq!(event_id_data_type, &DataTypes::bigint());
+    assert_eq!(event_type_data_type, &DataTypes::string());
+    assert_eq!(active_data_type, &DataTypes::boolean());
+    assert_eq!(score_data_type, &DataTypes::double());
+    assert_eq!(tags_data_type, &DataTypes::array(DataTypes::string()));
+
+    let expected_rows_per_table = TEST_MESSAGE_COUNT / MULTI_TABLE_ROUTES.len();
+    for (route_index, table_path) in table_paths.iter().enumerate() {
+        let table = connection
+            .get_table(table_path)
+            .await
+            .expect("Multi-table target should be readable");
+        let log_scanner = table
+            .new_scan()
+            .create_log_scanner()
+            .expect("Multi-table log scanner should be created");
+        log_scanner
+            .subscribe(0, EARLIEST_OFFSET)
+            .await
+            .expect("Multi-table log scanner should subscribe");
+
+        let row_read_deadline = Instant::now() + Duration::from_secs(WAIT_TIMEOUT_S);
+        let mut rows = Vec::with_capacity(expected_rows_per_table);
+        while rows.len() < expected_rows_per_table {
+            let records = timeout_at(row_read_deadline, log_scanner.poll(Duration::from_secs(1)))
+                .await
+                .expect("All routed rows should arrive before the timeout")
+                .expect("Routed rows should be readable");
+            rows.extend(records.into_iter().map(|record| record.row));
+        }
+
+        assert_eq!(rows.len(), expected_rows_per_table);
+        rows.sort_by_key(|row| {
+            row.get_row(event_column_index)
+                .expect("event should contain a row")
+                .get_row(envelope_field_index)
+                .expect("envelope should contain a row")
+                .get_row(context_field_index)
+                .expect("context should contain a row")
+                .get_row(pipeline_field_index)
+                .expect("pipeline should contain a row")
+                .get_row(stage_field_index)
+                .expect("stage should contain a row")
+                .get_row(processor_field_index)
+                .expect("processor should contain a row")
+                .get_row(runtime_field_index)
+                .expect("runtime should contain a row")
+                .get_row(node_field_index)
+                .expect("node should contain a row")
+                .get_row(location_field_index)
+                .expect("location should contain a row")
+                .get_row(details_field_index)
+                .expect("details should contain a row")
+                .get_long(event_id_field_index)
+                .expect("event_id should contain a bigint")
+        });
+        for (row_index, row) in rows.iter().enumerate() {
+            let expected_index = route_index + row_index * MULTI_TABLE_ROUTES.len();
+            let event = row
+                .get_row(event_column_index)
+                .expect("event should contain a row");
+            let envelope = event
+                .get_row(envelope_field_index)
+                .expect("envelope should contain a row");
+            let context = envelope
+                .get_row(context_field_index)
+                .expect("context should contain a row");
+            let pipeline = context
+                .get_row(pipeline_field_index)
+                .expect("pipeline should contain a row");
+            let stage = pipeline
+                .get_row(stage_field_index)
+                .expect("stage should contain a row");
+            let processor = stage
+                .get_row(processor_field_index)
+                .expect("processor should contain a row");
+            let runtime = processor
+                .get_row(runtime_field_index)
+                .expect("runtime should contain a row");
+            let node = runtime
+                .get_row(node_field_index)
+                .expect("node should contain a row");
+            let location = node
+                .get_row(location_field_index)
+                .expect("location should contain a row");
+            let details = location
+                .get_row(details_field_index)
+                .expect("details should contain a row");
+            assert_eq!(
+                details
+                    .get_long(event_id_field_index)
+                    .expect("event_id should contain a bigint"),
+                i64::try_from(expected_index).expect("Test event ID should fit in i64")
+            );
+            assert_eq!(
+                details
+                    .get_string(event_type_field_index)
+                    .expect("event_type should contain a string"),
+                format!("event-{expected_index}")
+            );
+            assert_eq!(
+                details
+                    .get_boolean(active_field_index)
+                    .expect("active should contain a boolean"),
+                expected_index.is_multiple_of(2)
+            );
+            assert_eq!(
+                details
+                    .get_double(score_field_index)
+                    .expect("score should contain a double"),
+                f64::from(u32::try_from(expected_index).expect("Test score should fit in u32"))
+                    + 0.5
+            );
+            let tags = details
+                .get_array(tags_field_index)
+                .expect("tags should contain an array");
+            assert_eq!(tags.size(), 3);
+            assert_eq!(
+                tags.get_string(0).expect("First tag should be a string"),
+                "streaming"
+            );
+            assert!(
+                tags.is_null_at(1)
+                    .expect("Second tag nullability should be readable")
+            );
+            assert_eq!(
+                tags.get_string(2).expect("Third tag should be a string"),
+                format!("event-{expected_index}")
+            );
+        }
     }
 }

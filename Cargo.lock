@@ -5326,7 +5326,6 @@ dependencies = [
 [[package]]
 name = "fluss-rs"
 version = "1.0.0"
-source = "git+https://github.com/apache/fluss.git?branch=main#41721623552c6281cc96fb1a23abf0ac155e9824"
 dependencies = [
  "arrow 59.2.0",
  "arrow-schema 59.2.0",

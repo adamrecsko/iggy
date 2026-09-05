@@ -37,6 +37,25 @@ use simd_json::Error as SimdJsonError;
 const UNSIGNED_64_DECIMAL_PRECISION: u8 = 20;
 const TIMESTAMP_PRECISION: u32 = 6;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SingleTableConfig {
+    include_metadata: bool,
+    include_checksum: bool,
+    include_origin_timestamp: bool,
+    payload_format: PayloadFormat,
+}
+
+impl From<&FlussSinkConfig> for SingleTableConfig {
+    fn from(config: &FlussSinkConfig) -> Self {
+        Self {
+            include_metadata: config.include_metadata,
+            include_checksum: config.include_checksum,
+            include_origin_timestamp: config.include_origin_timestamp,
+            payload_format: config.payload_format,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum Error {
     #[error(transparent)]
@@ -188,10 +207,6 @@ pub struct RowContext {
     pub partition_id: u32,
 }
 
-fn string_from_id(id: u128) -> String {
-    format!("{:032x}", id)
-}
-
 pub struct SingleTableBatchBuilder {
     id_builder: StringBuilder,
     checksum_builder: Decimal128Builder,
@@ -206,7 +221,14 @@ pub struct SingleTableBatchBuilder {
 }
 
 impl SingleTableBatchBuilder {
-    fn new(payload_format: PayloadFormat, extra_columns: Vec<ColumnKind>) -> Self {
+    pub(crate) fn new(config: &SingleTableConfig) -> Self {
+        let payload_format = config.payload_format;
+        let extra_columns = create_extra_columns_from_config(config);
+
+        Self::from_parts(payload_format, extra_columns)
+    }
+
+    fn from_parts(payload_format: PayloadFormat, extra_columns: Vec<ColumnKind>) -> Self {
         Self {
             id_builder: StringBuilder::new(),
             checksum_builder: Decimal128Builder::new()
@@ -336,33 +358,17 @@ pub struct SingleTableLayout {
 }
 
 impl SingleTableLayout {
-    pub fn from_config(config: &FlussSinkConfig) -> Self {
-        let mut columns: Vec<ColumnKind> = Vec::with_capacity(10);
-        columns.push(ColumnKind::MessageId("id"));
-
-        if config.include_checksum {
-            columns.push(ColumnKind::Checksum("checksum"));
-        };
-
-        if config.include_metadata {
-            columns.extend([
-                ColumnKind::MessageOffset("iggy_offset"),
-                ColumnKind::MessageTimestamp("iggy_timestamp"),
-                ColumnKind::Stream("iggy_stream"),
-                ColumnKind::Topic("iggy_topic"),
-                ColumnKind::PartitionId("iggy_partition_id"),
-            ]);
-        };
-
-        if config.include_origin_timestamp {
-            columns.push(ColumnKind::OriginTimestamp("iggy_origin_timestamp"));
-        }
-
+    pub(crate) fn from_single_table_config(config: &SingleTableConfig) -> Self {
         Self {
-            extra_columns: columns,
+            extra_columns: create_extra_columns_from_config(config),
             payload_format: config.payload_format,
             primary_key_columns: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn from_config(config: &FlussSinkConfig) -> Self {
+        Self::from_single_table_config(&config.into())
     }
 
     fn build_schema(&self) -> Result<fluss::metadata::Schema, Error> {
@@ -386,7 +392,7 @@ impl SingleTableLayout {
 
         let mut schema_builder = fluss::metadata::Schema::builder().with_columns(columns);
         if !self.primary_key_columns.is_empty() {
-            schema_builder = schema_builder.primary_key(self.primary_key_columns.clone());
+            schema_builder = schema_builder.primary_key(self.primary_key_columns.clone())?;
         }
         Ok(schema_builder.build()?)
     }
@@ -398,10 +404,35 @@ impl SingleTableLayout {
             .schema(schema)
             .build()?)
     }
+}
 
-    pub(crate) fn create_arrow_builder(&self) -> SingleTableBatchBuilder {
-        SingleTableBatchBuilder::new(self.payload_format, self.extra_columns.clone())
+fn string_from_id(id: u128) -> String {
+    format!("{:032x}", id)
+}
+
+fn create_extra_columns_from_config(config: &SingleTableConfig) -> Vec<ColumnKind> {
+    let mut columns: Vec<ColumnKind> = Vec::with_capacity(10);
+    columns.push(ColumnKind::MessageId("id"));
+
+    if config.include_checksum {
+        columns.push(ColumnKind::Checksum("checksum"));
+    };
+
+    if config.include_metadata {
+        columns.extend([
+            ColumnKind::MessageOffset("iggy_offset"),
+            ColumnKind::MessageTimestamp("iggy_timestamp"),
+            ColumnKind::Stream("iggy_stream"),
+            ColumnKind::Topic("iggy_topic"),
+            ColumnKind::PartitionId("iggy_partition_id"),
+        ]);
+    };
+
+    if config.include_origin_timestamp {
+        columns.push(ColumnKind::OriginTimestamp("iggy_origin_timestamp"));
     }
+
+    columns
 }
 
 #[cfg(test)]
@@ -415,8 +446,8 @@ mod tests {
     use iggy_connector_sdk::{ConsumedMessage, Payload, Schema};
 
     use super::{
-        ColumnKind, ConvertedMessage, Error as SchemaError, RowContext, SingleTableLayout,
-        TIMESTAMP_PRECISION, UNSIGNED_64_DECIMAL_PRECISION,
+        ColumnKind, ConvertedMessage, Error as SchemaError, RowContext, SingleTableBatchBuilder,
+        SingleTableLayout, TIMESTAMP_PRECISION, UNSIGNED_64_DECIMAL_PRECISION,
     };
     use crate::{FlussSinkConfig, PayloadFormat};
 
@@ -466,10 +497,14 @@ mod tests {
             .expect("Arrow column should have the expected type")
     }
 
+    fn create_arrow_builder(layout: &SingleTableLayout) -> SingleTableBatchBuilder {
+        SingleTableBatchBuilder::from_parts(layout.payload_format, layout.extra_columns.clone())
+    }
+
     fn build_arrow_rows(layout: &SingleTableLayout, messages: Vec<ConsumedMessage>) -> RecordBatch {
-        let mut builder = layout.create_arrow_builder();
+        let mut builder = create_arrow_builder(layout);
         for message in messages {
-            builder.append(message).expect("Message should appended");
+            builder.append(message).expect("Message should append");
         }
         builder.finish(&test_context())
     }
@@ -590,7 +625,7 @@ mod tests {
     fn given_invalid_utf8_before_valid_message_when_encoding_arrow_rows_should_skip_invalid_row() {
         let config = config_without_optional_columns(PayloadFormat::Text);
         let layout = SingleTableLayout::from_config(&config);
-        let mut builder = layout.create_arrow_builder();
+        let mut builder = create_arrow_builder(&layout);
         let mut valid_message = test_message(Payload::Text("valid".to_string()));
         valid_message.id = 102;
         let messages = [test_message(Payload::Raw(vec![0xff])), valid_message];

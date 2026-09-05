@@ -59,7 +59,7 @@ pub use doris::{
     DorisSinkMaxFilterRatioFixture, DorisSinkPreCreatedFixture,
 };
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
-pub use fluss::FlussSinkFixture;
+pub use fluss::{FlussMultiSinkFixture, FlussSinkFixture};
 pub use http::{
     HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture,
     HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture, HttpSinkRawFixture,

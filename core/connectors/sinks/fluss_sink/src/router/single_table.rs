@@ -16,84 +16,54 @@
 // under the License.
 
 use fluss::metadata::TablePath;
-use iggy_connector_sdk::{
-    ConsumedMessage, Error as ConnectorError, MessagesMetadata, TopicMetadata,
-};
-use thiserror::Error;
+use iggy_connector_sdk::{ConsumedMessage, MessagesMetadata, TopicMetadata};
 use tracing::error;
 
+use super::Error;
 use crate::{
     FlussSinkConfig,
-    schema::{Error as SchemaError, RowContext, SingleTableLayout},
-    writer::{self, Op, TableWriteResult, TableWriter},
+    schema_catalog::SchemaCatalog,
+    static_schema::{RowContext, SingleTableBatchBuilder, SingleTableConfig},
+    writer::{Op, Stat, TableWriter},
 };
-
-#[derive(Debug, Error)]
-pub(crate) enum Error {
-    #[error(transparent)]
-    WriterError(writer::WriterError),
-    #[error("Failed to build Fluss table descriptor: {source}")]
-    BuildTableDescriptor {
-        #[source]
-        source: Box<SchemaError>,
-    },
-    #[error("Failed to write batch record because of: {source}")]
-    Append {
-        #[source]
-        source: writer::WriterError,
-    },
-}
-
-impl From<writer::WriterError> for Error {
-    fn from(error: writer::WriterError) -> Self {
-        Self::WriterError(error)
-    }
-}
-
-impl From<Error> for ConnectorError {
-    fn from(error: Error) -> Self {
-        let message = error.to_string();
-        match error {
-            Error::WriterError { .. } => Self::InitError(message),
-            Error::BuildTableDescriptor { .. } | Error::Append { .. } => {
-                Self::CannotStoreData(message)
-            }
-        }
-    }
-}
 
 #[derive(Debug)]
 pub(crate) struct SingleTableRouter {
-    table_layout: SingleTableLayout,
+    schema_catalog: SchemaCatalog,
     table_path: TablePath,
     auto_create_table: bool,
+    config: SingleTableConfig,
 }
 
 impl SingleTableRouter {
     pub(crate) fn new(config: &FlussSinkConfig) -> Self {
-        let table_layout = SingleTableLayout::from_config(config);
         let table_path =
             TablePath::new(config.target_database.clone(), config.target_table.clone());
+        let schema_catalog = SchemaCatalog::default();
         Self {
-            table_layout,
+            schema_catalog,
             table_path,
             auto_create_table: config.auto_create_table,
+            config: config.into(),
         }
     }
 
     pub(crate) async fn init(&self, writer: &impl TableWriter) -> Result<(), Error> {
         if self.auto_create_table {
-            let table_descriptor =
-                self.table_layout
-                    .build_table_descriptor()
-                    .map_err(|source| Error::BuildTableDescriptor {
-                        source: Box::new(source),
-                    })?;
+            let entry = self
+                .schema_catalog
+                .create_and_store_entry_from_table(&self.table_path, writer)
+                .await?;
 
-            writer
-                .create_table_if_not_exists(&self.table_path, &table_descriptor)
-                .await
-                .map_err(Error::from)?;
+            if entry.is_none() {
+                let entry = self
+                    .schema_catalog
+                    .create_and_store_static_schema_entry(&self.table_path, &self.config)?;
+
+                writer
+                    .create_table_if_not_exists(&self.table_path, &entry.table_descriptor)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -104,30 +74,28 @@ impl SingleTableRouter {
         topic_metadata: &TopicMetadata,
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
-    ) -> Result<TableWriteResult, Error> {
-        let mut stat = TableWriteResult::default();
+    ) -> Result<Stat, Error> {
+        let mut stat = Stat::default();
         let context = RowContext {
             topic: topic_metadata.topic.clone(),
             stream: topic_metadata.stream.clone(),
             partition_id: messages_metadata.partition_id,
         };
-        let mut builder = self.table_layout.create_arrow_builder();
+        let mut builder = SingleTableBatchBuilder::new(&self.config);
         for message in messages {
-            if let Err(err) = builder.append(message) {
+            if let Err(error) = builder.append(message) {
                 error!(
-                    "FlussSink: Can not add record to batch builder, skipping message because of error: [{}]",
-                    err
+                    "FlussSink: Can not add record to batch builder, skipping message because of error: [{error}]"
                 );
-                stat.insertion_errors += 1;
+                stat.inc_err();
             } else {
-                stat.messages_processed += 1;
+                stat.inc_appended();
             }
         }
         let record_batch = builder.finish(&context);
         writer
             .write_to_table(&self.table_path, Op::Append, record_batch)
-            .await
-            .map_err(|e| Error::Append { source: e })?;
+            .await?;
 
         Ok(stat)
     }
@@ -141,13 +109,17 @@ mod tests {
         array::{Int64Array, StringArray},
         record_batch::RecordBatch,
     };
-    use fluss::metadata::{TableDescriptor, TablePath};
+    use fluss::{
+        client::FlussTable,
+        metadata::{TableDescriptor, TablePath},
+    };
     use iggy_connector_sdk::{ConsumedMessage, MessagesMetadata, Payload, Schema, TopicMetadata};
 
     use super::{Error as RouterError, SingleTableRouter};
     use crate::{
         FlussSinkConfig, PayloadFormat,
-        writer::{Op, TableWriteResult, TableWriter, WriterError},
+        static_schema::SingleTableLayout,
+        writer::{Op, Stat, TableWriter, WriterError},
     };
 
     const MESSAGE_TIMESTAMP: u64 = 1_700_000_000_123_456;
@@ -212,6 +184,12 @@ mod tests {
                 });
             Ok(())
         }
+
+        async fn get_table(&self, table_path: &TablePath) -> Result<FlussTable<'_>, WriterError> {
+            Err(WriterError::TableNotFound {
+                table_path: table_path.to_owned(),
+            })
+        }
     }
 
     fn test_config() -> FlussSinkConfig {
@@ -257,12 +235,12 @@ mod tests {
     }
 
     fn assert_stats(
-        stats: &TableWriteResult,
+        stats: &Stat,
         expected_messages_processed: u64,
         expected_insertion_errors: u64,
     ) {
-        assert_eq!(stats.messages_processed, expected_messages_processed);
-        assert_eq!(stats.insertion_errors, expected_insertion_errors);
+        assert_eq!(stats.appended, expected_messages_processed);
+        assert_eq!(stats.errors, expected_insertion_errors);
     }
 
     #[test]
@@ -294,8 +272,7 @@ mod tests {
         assert_eq!(table_creations[0].table_path, router.table_path);
         assert_eq!(
             table_creations[0].table_descriptor,
-            router
-                .table_layout
+            SingleTableLayout::from_single_table_config(&router.config)
                 .build_table_descriptor()
                 .expect("Expected table descriptor should build")
         );
@@ -466,6 +443,6 @@ mod tests {
         .err()
         .expect("Table write should fail");
 
-        assert!(matches!(error, RouterError::Append { .. }));
+        assert!(matches!(error, RouterError::WriterError { .. }));
     }
 }

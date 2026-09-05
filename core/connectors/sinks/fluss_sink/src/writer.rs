@@ -22,21 +22,19 @@ use std::{
 
 use arrow::array::RecordBatch;
 use fluss::{
-    client::{AppendWriter, FlussConnection},
-    error::Error as FlussError,
+    client::{AppendWriter, FlussConnection, FlussTable},
+    error::Error::{self as FlussError},
     metadata::{TableDescriptor, TablePath},
 };
 use iggy_connector_sdk::Error as ConnectorError;
 use thiserror::Error;
 
-use crate::{FlussSinkConfig, schema::Error as SchemaError};
+use crate::FlussSinkConfig;
 
 #[derive(Debug, Error)]
 pub(crate) enum WriterError {
     #[error(transparent)]
     Connector(ConnectorError),
-    #[error(transparent)]
-    Schema(SchemaError),
     #[error("Fluss connection is not initialized")]
     ConnectionNotInitialized,
     #[error("Failed to connect to Fluss: {source}")]
@@ -65,8 +63,10 @@ pub(crate) enum WriterError {
         #[source]
         source: Box<FlussError>,
     },
-    #[error("Failed to get Fluss table '{table_path}': {source}")]
-    GetTable {
+    #[error("Failed to get Fluss table, table not found: '{table_path}'")]
+    TableNotFound { table_path: TablePath },
+    #[error("Failed to get Fluss table '{table_path}' because of error: {source}")]
+    GetTableFailed {
         table_path: TablePath,
         #[source]
         source: Box<FlussError>,
@@ -89,7 +89,9 @@ pub(crate) enum WriterError {
         #[source]
         source: Box<FlussError>,
     },
-    #[error("Failed to flush rows to Fluss table '{table_path}': {source}")]
+    #[error(
+        "Failed to flush rows to Fluss table, data can be partially stored, append operation can duplicate data '{table_path}': {source}"
+    )]
     FlushRows {
         table_path: TablePath,
         #[source]
@@ -103,18 +105,11 @@ impl From<ConnectorError> for WriterError {
     }
 }
 
-impl From<SchemaError> for WriterError {
-    fn from(error: SchemaError) -> Self {
-        Self::Schema(error)
-    }
-}
-
 impl From<WriterError> for ConnectorError {
     fn from(error: WriterError) -> Self {
         let message = error.to_string();
         match error {
             WriterError::Connector(source) => source,
-            WriterError::Schema(source) => source.into(),
             WriterError::ConnectionNotInitialized | WriterError::Connect { .. } => {
                 Self::InitError(message)
             }
@@ -122,7 +117,8 @@ impl From<WriterError> for ConnectorError {
             WriterError::CloseConnection { .. } => Self::Connection(message),
             WriterError::GetAdminClient { .. }
             | WriterError::CreateTable { .. }
-            | WriterError::GetTable { .. }
+            | WriterError::GetTableFailed { .. }
+            | WriterError::TableNotFound { .. }
             | WriterError::CreateAppender { .. }
             | WriterError::CreateWriter { .. }
             | WriterError::AppendArrowBatch { .. }
@@ -132,9 +128,32 @@ impl From<WriterError> for ConnectorError {
 }
 
 #[derive(Default)]
-pub struct TableWriteResult {
-    pub insertion_errors: u64,
-    pub messages_processed: u64,
+pub(crate) struct Stat {
+    pub(crate) errors: u64,
+    pub(crate) appended: u64,
+    pub(crate) inserted: u64,
+}
+
+impl Stat {
+    pub(crate) fn add(self, other: Self) -> Self {
+        Self {
+            errors: self.errors + other.errors,
+            appended: self.appended + other.appended,
+            inserted: self.inserted + other.inserted,
+        }
+    }
+
+    pub(crate) fn inc_err(&mut self) {
+        self.errors += 1;
+    }
+
+    pub(crate) fn inc_err_by(&mut self, count: u64) {
+        self.errors += count;
+    }
+
+    pub(crate) fn inc_appended(&mut self) {
+        self.appended += 1;
+    }
 }
 
 #[derive(Eq, PartialEq, Debug)]
@@ -155,6 +174,8 @@ pub(crate) trait TableWriter {
         table_path: &TablePath,
         table_descriptor: &TableDescriptor,
     ) -> Result<(), WriterError>;
+
+    async fn get_table(&self, table_path: &TablePath) -> Result<FlussTable<'_>, WriterError>;
 }
 
 pub struct FlussWriter {
@@ -201,17 +222,15 @@ impl FlussWriter {
         Ok(())
     }
 
-    pub(crate) async fn close(&self) -> Result<(), WriterError> {
+    pub(crate) async fn close(&mut self) -> Result<(), WriterError> {
         self.get_connection()?
-            .get_or_create_writer_client()
-            .map_err(|source| WriterError::InvalidWriterConfig {
-                source: Box::new(source),
-            })?
             .close(Duration::from_secs(30))
             .await
             .map_err(|source| WriterError::CloseConnection {
                 source: Box::new(source),
-            })
+            })?;
+        self.connection = None;
+        Ok(())
     }
     async fn append_record_batch(
         &self,
@@ -234,16 +253,49 @@ impl FlussWriter {
             .ok_or(WriterError::ConnectionNotInitialized)
     }
 
-    async fn create_writer(&self, table_path: &TablePath) -> Result<AppendWriter, WriterError> {
-        let table = self
-            .get_connection()?
-            .get_table(table_path)
+    async fn get_table_by_path(
+        &self,
+        table_path: &TablePath,
+    ) -> Result<FlussTable<'_>, WriterError> {
+        let connection = self.get_connection()?;
+
+        // The fluss get table API at the moment, doesn't return a specific error for table not
+        // found, so we need to check if the table exists first.
+        let table_id = connection
+            .get_metadata()
+            .fetch_table_id(table_path)
             .await
-            .map_err(|source| WriterError::GetTable {
+            .map_err(|source| WriterError::GetTableFailed {
                 table_path: table_path.clone(),
                 source: Box::new(source),
             })?;
 
+        if table_id.is_none() {
+            return Err(WriterError::TableNotFound {
+                table_path: table_path.clone(),
+            });
+        }
+
+        connection
+            .get_table(table_path)
+            .await
+            .map_err(|source| match source {
+                FlussError::FlussAPIError { api_error }
+                    if api_error.code == fluss::rpc::FlussError::TableNotExist.code() =>
+                {
+                    WriterError::TableNotFound {
+                        table_path: table_path.clone(),
+                    }
+                }
+                _ => WriterError::GetTableFailed {
+                    table_path: table_path.clone(),
+                    source: Box::new(source),
+                },
+            })
+    }
+
+    async fn create_writer(&self, table_path: &TablePath) -> Result<AppendWriter, WriterError> {
+        let table = self.get_table_by_path(table_path).await?;
         table
             .new_append()
             .map_err(|source| WriterError::CreateAppender {
@@ -300,6 +352,10 @@ impl TableWriter for FlussWriter {
         match op {
             Op::Append => self.append_record_batch(table_path, batch).await,
         }
+    }
+
+    async fn get_table(&self, table_path: &TablePath) -> Result<FlussTable<'_>, WriterError> {
+        self.get_table_by_path(table_path).await
     }
 }
 

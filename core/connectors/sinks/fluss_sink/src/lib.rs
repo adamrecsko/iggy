@@ -22,11 +22,12 @@ use iggy_connector_sdk::{
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use crate::{router::SingleTableRouter, writer::FlussWriter};
+use crate::{router::Router, writer::FlussWriter};
 
 mod config;
 mod router;
-mod schema;
+mod schema_catalog;
+mod static_schema;
 mod writer;
 pub use config::{FlussSinkConfig, PayloadFormat};
 
@@ -44,13 +45,12 @@ pub struct FlussSink {
     id: u32,
     state: Mutex<State>,
     writer: writer::FlussWriter,
-    router: SingleTableRouter,
+    router: Router,
 }
 
 impl FlussSink {
     pub fn new(id: u32, config: FlussSinkConfig) -> Self {
         let writer = FlussWriter::new(config.clone());
-        let router = SingleTableRouter::new(&config);
         Self {
             id,
             state: Mutex::new(State {
@@ -59,7 +59,7 @@ impl FlussSink {
                 insertion_errors: 0,
             }),
             writer,
-            router,
+            router: Router::from_config(&config),
         }
     }
 }
@@ -67,8 +67,10 @@ impl FlussSink {
 #[async_trait]
 impl Sink for FlussSink {
     async fn open(&mut self) -> Result<(), Error> {
-        self.writer.connect().await.map_err(Error::from)?;
-        self.router.init(&self.writer).await?;
+        self.writer.connect().await?;
+        if let Router::SingleTable(router) = &self.router {
+            router.init(&self.writer).await?;
+        }
         info!("Opened Fluss sink connector ID: {}", self.id);
         Ok(())
     }
@@ -96,16 +98,23 @@ impl Sink for FlussSink {
             messages_metadata.current_offset,
             invocation
         );
-        let result = self
-            .router
-            .route(&self.writer, topic_metadata, messages_metadata, messages)
-            .await;
+
+        let result = match &self.router {
+            Router::SingleTable(router) => {
+                router
+                    .route(&self.writer, topic_metadata, messages_metadata, messages)
+                    .await
+            }
+            Router::MultiTable(router) => router.route(&self.writer, messages).await,
+        };
 
         match result {
             Ok(r) => {
-                let mut state = self.state.lock().await;
-                state.insertion_errors += r.insertion_errors;
-                state.messages_processed += r.messages_processed;
+                {
+                    let mut state = self.state.lock().await;
+                    state.insertion_errors += r.errors;
+                    state.messages_processed += r.appended + r.inserted;
+                }
                 Ok(())
             }
 
@@ -114,11 +123,13 @@ impl Sink for FlussSink {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        let state = self.state.lock().await;
-        info!(
-            "Fluss sink ID: {} processed {} messages with {} errors",
-            self.id, state.messages_processed, state.insertion_errors
-        );
+        {
+            let state = self.state.lock().await;
+            info!(
+                "Fluss sink ID: {} processed {} messages with {} errors",
+                self.id, state.messages_processed, state.insertion_errors
+            );
+        }
         self.writer.close().await.map_err(Into::into)
     }
 }

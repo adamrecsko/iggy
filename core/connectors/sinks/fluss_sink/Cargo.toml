@@ -40,6 +40,7 @@ iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 simd-json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

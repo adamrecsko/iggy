@@ -29,9 +29,20 @@ pub enum PayloadFormat {
     Text,
 }
 
-const DEFAULT_FLUSS_WRITER_RETRIES: i32 = 3;
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouterType {
+    #[default]
+    Single,
+    Multi,
+}
 
-#[derive(Debug, Deserialize, Clone)]
+const DEFAULT_FLUSS_WRITER_RETRIES: i32 = 3;
+const DEFAULT_TARGET_DATABASE: &str = "fluss";
+const DEFAULT_TARGET_TABLE: &str = "iggy_messages";
+const DEFAULT_ROUTE_KEY: &str = "table";
+
+#[derive(Deserialize, Clone)]
 #[serde(default)]
 pub struct FlussSinkConfig {
     pub bootstrap_servers: String,
@@ -58,6 +69,8 @@ pub struct FlussSinkConfig {
     pub include_checksum: bool,
     pub include_origin_timestamp: bool,
     pub payload_format: PayloadFormat,
+    pub route_key: String,
+    pub router_type: RouterType,
 }
 
 impl Default for FlussSinkConfig {
@@ -81,13 +94,15 @@ impl Default for FlussSinkConfig {
             security_sasl_mechanism: fluss_config.security_sasl_mechanism,
             security_sasl_username: fluss_config.security_sasl_username,
             security_sasl_password: fluss_config.security_sasl_password.into(),
-            target_database: "fluss".to_string(),
-            target_table: "iggy_messages".to_string(),
+            target_database: DEFAULT_TARGET_DATABASE.to_owned(),
+            target_table: DEFAULT_TARGET_TABLE.to_owned(),
             auto_create_table: true,
             include_metadata: true,
             include_checksum: true,
             include_origin_timestamp: true,
             payload_format: PayloadFormat::default(),
+            route_key: DEFAULT_ROUTE_KEY.to_owned(),
+            router_type: RouterType::default(),
         }
     }
 }
